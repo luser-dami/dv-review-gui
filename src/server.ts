@@ -276,26 +276,42 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+function openBrowser(url: string): void {
+  if (process.env.DV_UI_NO_OPEN) return;
+  let opener: ChildProcess;
+  if (process.platform === "win32") {
+    // Windows: open in Edge explicitly, fall back to the default browser.
+    const edge = [
+      "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+      "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+    ].find((p) => existsSync(p));
+    opener = edge
+      ? spawn(edge, ["--new-window", url], { stdio: "ignore", detached: true })
+      : spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true });
+  } else {
+    opener = spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], {
+      stdio: "ignore",
+      detached: true,
+    });
+  }
+  opener.unref();
+}
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    // Another dv-review-gui instance is already serving this port — the GUI
+    // is up, so just (re)open the browser instead of failing the task.
+    const url = `http://127.0.0.1:${PORT}`;
+    console.log(`dv-review-gui already running at ${url} — opening browser`);
+    openBrowser(url);
+    process.exit(0);
+  }
+  console.error(err);
+  process.exit(1);
+});
+
 server.listen(PORT, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${PORT}`;
   console.log(`dv-review-gui v${VERSION} → ${url}  (workspace: ${DIR})`);
-  if (!process.env.DV_UI_NO_OPEN) {
-    let opener: ChildProcess;
-    if (process.platform === "win32") {
-      // Windows: open in Edge explicitly, fall back to the default browser.
-      const edge = [
-        "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-        "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
-      ].find((p) => existsSync(p));
-      opener = edge
-        ? spawn(edge, ["--new-window", url], { stdio: "ignore", detached: true })
-        : spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true });
-    } else {
-      opener = spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], {
-        stdio: "ignore",
-        detached: true,
-      });
-    }
-    opener.unref();
-  }
+  openBrowser(url);
 });
