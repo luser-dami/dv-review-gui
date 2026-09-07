@@ -25,6 +25,7 @@ import { runDv } from "./dv.js";
 import { dvApi, type Review, type ReviewComment } from "./api.js";
 import {
   applyRevertToModel,
+  DivergedError,
   parseWorkspaceDiff,
   revertLineInFile,
   StaleModelError,
@@ -274,7 +275,24 @@ const server = http.createServer(async (req, res) => {
       const kind = String(body.kind ?? "");
       const line = Number(body.line);
       const text = String(body.text ?? "");
-      revertLineInFile(DIR, p, kind, line, text); // disk first; strict validation
+      // Old pages (pre-nn) send NaN → null in JSON → 0 here. Reject with an
+      // actionable message instead of a misleading out-of-range error.
+      if (!p || !Number.isInteger(line) || line < 1) {
+        sendJson(res, 400, { error: "无效的请求（行号缺失）—— 浏览器页面版本过旧，请关掉旧的 GUI 窗口或强制刷新（Ctrl+F5）" });
+        return;
+      }
+      try {
+        revertLineInFile(DIR, p, kind, line, text); // disk first; strict validation
+      } catch (e) {
+        if (e instanceof DivergedError) {
+          // Disk no longer matches the model (external edit or dv lag) —
+          // drop the cache so the client's automatic reload gets fresh truth.
+          wsDiffCache = null;
+          sendJson(res, 409, { error: e.message, stale: true });
+          return;
+        }
+        throw e;
+      }
       if (!wsDiffCache) {
         // No model to mirror into (server restarted after the client loaded).
         // The client must wait out dv's sync lag, then force-reload.

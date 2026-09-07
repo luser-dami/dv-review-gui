@@ -38,6 +38,11 @@ export class StaleModelError extends Error {
   override name = "StaleModelError";
 }
 
+/** Thrown when the working file on disk no longer matches the diff model. */
+export class DivergedError extends Error {
+  override name = "DivergedError";
+}
+
 export function parseWorkspaceDiff(text: string): DiffFile[] {
   const files: DiffFile[] = [];
   let cur: DiffFile | undefined;
@@ -210,10 +215,10 @@ export function revertLineInFile(root: string, rel: string, kind: string, line: 
   if (kind === "add") {
     const idx = line - 1;
     if (!Number.isInteger(idx) || idx < 0 || idx >= lines.length) {
-      throw new Error("行号超出文件范围 — 请刷新 diff 后重试");
+      throw new DivergedError("行号超出文件范围 — 文件已在磁盘上变化，正在重新加载 diff");
     }
     if (lines[idx].replace(/\r$/, "") !== text.replace(/\r$/, "")) {
-      throw new Error("文件内容已变化，与 diff 不一致 — 请刷新后重试");
+      throw new DivergedError("文件内容已变化，与 diff 不一致 — 正在重新加载");
     }
     lines.splice(idx, 1);
     writeFileSync(abs, lines.length === 1 && lines[0] === "" ? "" : lines.join("\n"));
@@ -222,7 +227,7 @@ export function revertLineInFile(root: string, rel: string, kind: string, line: 
   if (kind === "del") {
     const idx = line - 1;
     if (!Number.isInteger(idx) || idx < 0 || idx > lines.length) {
-      throw new Error("文件行数已变化，与 diff 不一致 — 请刷新后重试");
+      throw new DivergedError("文件行数已变化，与 diff 不一致 — 正在重新加载");
     }
     const eol = raw.includes("\r\n") ? "\r\n" : "\n";
     lines.splice(idx, 0, text + (eol === "\r\n" ? "\r" : ""));

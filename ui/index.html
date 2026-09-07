@@ -612,7 +612,16 @@ async function refreshAll() {
   try {
     const state = await api("/api/state");
     if (state.version !== SERVER_VERSION) {
-      banner(`界面（${SERVER_VERSION}）与服务端（${state.version ?? "旧版"}）版本不一致 —— 端口 ${location.port} 上有旧实例在运行。请完全退出后重新启动（Zed 里再按一次快捷键无效时，先杀掉占用进程）。`);
+      // Page older than the server: one reload fetches the matching page.
+      // (Page newer than the server can't be fixed by reloading — banner.)
+      if (!sessionStorage.getItem("dv-ver-reload")) {
+        sessionStorage.setItem("dv-ver-reload", "1");
+        location.reload();
+        return;
+      }
+      banner(`界面（${SERVER_VERSION}）与服务端（${state.version ?? "旧版"}）版本不一致 —— 端口 ${location.port} 上有旧实例在运行，请关掉旧的 GUI 窗口后重试。`);
+    } else {
+      sessionStorage.removeItem("dv-ver-reload");
     }
     renderState(state);
   } catch (e) { banner(String(e.message || e), false); }
