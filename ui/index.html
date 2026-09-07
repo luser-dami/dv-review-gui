@@ -27,6 +27,20 @@
   i.sign { display: inline-block; width: 14px; font-style: normal; user-select: none; opacity: .7; }
   .add i.sign { color: var(--green); }
   .del i.sign { color: var(--red); }
+  .diffcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
+  .diffhead { padding: 6px 12px; background: #f0f2f5; border-bottom: 1px solid var(--border); }
+  .hunkband { background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 11.5px; padding: 3px 12px; border-top: 1px solid var(--border); }
+  .dl { display: flex; align-items: flex-start; font-family: var(--mono); font-size: 12px; line-height: 1.7; }
+  .dl:hover { background: #f2f6fb; }
+  .dl.add { background: var(--green-soft); }
+  .dl.del { background: var(--red-soft); }
+  .dl .ln { flex: 0 0 40px; text-align: right; padding-right: 6px; color: var(--dim); user-select: none; font-size: 11px; }
+  .dl .sign { flex: 0 0 14px; text-align: center; font-style: normal; user-select: none; }
+  .dl.add .sign { color: var(--green); }
+  .dl .code { white-space: pre-wrap; word-break: break-all; flex: 1; padding-right: 6px; }
+  button.rv { visibility: hidden; flex: 0 0 26px; margin-right: 8px; border: none; background: none; color: var(--dim); cursor: pointer; font-size: 13px; padding: 0; }
+  .dl:hover button.rv { visibility: visible; }
+  .dl button.rv:hover { color: var(--red); }
   header .brand { font-weight: 700; font-size: 15px; }
   header .brand span { color: var(--accent); }
   .chip {
@@ -350,14 +364,62 @@ async function showDiff(path) {
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+function renderWorkspaceDiff(files) {
+  if (!files.length) return `<div class="empty ok">✓ 工作区干净，没有待提交的变更</div>`;
+  return files.map((f) => {
+    if (f.binary) {
+      return `<div class="diffcard"><div class="diffhead"><span class="path">${esc(f.path)}</span></div><div class="meta" style="padding:8px 12px">二进制文件 — 不支持行级操作</div></div>`;
+    }
+    const rows = f.hunks.map((h) =>
+      `<div class="hunkband">${esc(h.header)}</div>` +
+      h.lines.map((l) => {
+        const revert = l.t === " " ? "" :
+          `<button class="rv" data-kind="${l.t === "+" ? "add" : "del"}" data-line="${l.n}" data-path="${esc(f.path)}" data-text="${esc(l.text)}" title="回退此行">↩</button>`;
+        const cls = l.t === "+" ? "add" : l.t === "-" ? "del" : "ctx";
+        return `<div class="dl ${cls}"><span class="ln">${l.t === "-" ? l.n : ""}</span><span class="ln">${l.t === "-" ? "" : l.n}</span><i class="sign">${esc(l.t)}</i><span class="code">${hi(l.text, langOf(f.path))}</span>${revert}</div>`;
+      }).join("")
+    ).join("");
+    return `<div class="diffcard"><div class="diffhead"><span class="path">${esc(f.path)}</span></div><div class="diffbody">${rows}</div></div>`;
+  }).join("");
+}
+
 async function showWorkspaceDiff(path) {
-  const q = new URLSearchParams();
-  if (path) q.set("path", path);
-  const text = await fetch(`/api/diff?${q}`).then((r) => r.text());
   $("review-pane").style.display = "none";
   $("home").style.display = "block";
-  $("log").innerHTML = `<h2>diff · ${esc(path || "全部变更")}</h2><div class="card"><pre id="diff"><div>${diffHtml(text)}</div></pre></div>`;
+  $("log").innerHTML = `<span class="spin">加载 diff…</span>`;
+  const q = path ? "?path=" + encodeURIComponent(path) : "";
+  const [data, state] = await Promise.all([
+    fetch(`/api/workspace-diff${q}`).then((r) => r.json()),
+    fetch("/api/state").then((r) => r.json()),
+  ]);
+  renderState(state);
+  $("log").innerHTML = `<h2>待提交变更 · diff（悬停变更行 → ↩ 回退）</h2>` + renderWorkspaceDiff(data.files ?? []);
 }
+
+async function revertLine(btn) {
+  const { kind, line, text, path } = btn.dataset;
+  btn.disabled = true;
+  try {
+    await api("/api/revert-line", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, kind, line: Number(line), text }),
+    });
+    banner("已回退 1 行", true);
+    if (kind === "add") {
+      btn.closest(".dl").remove(); // 乐观更新：dv diff 有秒级同步滞后
+    }
+    setTimeout(() => showWorkspaceDiff(path), 3000); // 之后以后台刷新为准
+  } catch (e) {
+    banner(String(e.message || e), false);
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("button.rv");
+  if (b) revertLine(b);
+});
 
 async function act(action) {
   if (!currentId) return;
