@@ -18,11 +18,18 @@
  */
 import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runDv } from "./dv.js";
 import { dvApi, type Review, type ReviewComment } from "./api.js";
+import {
+  applyRevertToModel,
+  parseWorkspaceDiff,
+  revertLineInFile,
+  StaleModelError,
+  type DiffFile,
+} from "./model.js";
 
 const VERSION = "0.1.0";
 const PORT = Number(process.env.DV_UI_PORT ?? 7391);
@@ -130,126 +137,28 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return promise;
 }
 
-export interface DiffLine {
-  t: "+" | "-" | " ";
-  text: string;
-  /** 1-based line number: new-file line for +/context, old-file line for - */
-  n?: number;
-}
-export interface DiffHunk {
-  oldStart: number;
-  newStart: number;
-  header: string;
-  lines: DiffLine[];
-}
-export interface DiffFile {
-  path: string;
-  binary: boolean;
-  hunks: DiffHunk[];
-}
+// ---------- workspace-diff cache (server-side model) ----------
+//
+// One model per server, mirrored by the client: loaded once on view entry
+// (?refresh=1), kept in sync by /api/revert-line without re-running `dv diff`
+// (dv's sync lag is 2-7s, so post-revert snapshots cannot be trusted).
 
-export function parseWorkspaceDiff(text: string): DiffFile[] {
-  const files: DiffFile[] = [];
-  let cur: DiffFile | undefined;
-  let hunk: DiffHunk | undefined;
-  let oldNo = 0;
-  let newNo = 0;
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (line.startsWith("diff --git ")) {
-      cur = { path: line.match(/^diff --git a\/(.*) b\/(.*)$/)?.[2] ?? "", binary: false, hunks: [] };
-      files.push(cur);
-      hunk = undefined;
-      continue;
-    }
-    if (!cur) continue;
-    if (/^Binary files /.test(line) || line.includes("Binary files")) {
-      cur.binary = true;
-      continue;
-    }
-    if (line.startsWith("@@")) {
-      const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
-      if (!m) {
-        hunk = undefined;
-        continue;
-      }
-      hunk = { oldStart: Number(m[1]), newStart: Number(m[3]), header: line, lines: [] };
-      cur.hunks.push(hunk);
-      oldNo = Number(m[1]);
-      newNo = Number(m[3]);
-      continue;
-    }
-    if (
-      line.startsWith("+++ ") ||
-      line.startsWith("--- ") ||
-      line.startsWith("index ") ||
-      /^(new|deleted) file mode|^similarity index|^rename (from|to)/.test(line)
-    ) {
-      continue;
-    }
-    if (!hunk) continue;
-    if (line.startsWith("+")) {
-      hunk.lines.push({ t: "+", text: line.slice(1), n: newNo });
-      newNo++;
-    } else if (line.startsWith("-")) {
-      hunk.lines.push({ t: "-", text: line.slice(1), n: oldNo });
-      oldNo++;
-    } else {
-      // context line ("content" or empty); dv emits empty strings for blank lines
-      hunk.lines.push({ t: " ", text: line.startsWith(" ") ? line.slice(1) : "", n: newNo });
-      newNo++;
-      oldNo++;
-    }
-  }
-  return files;
-}
+const WS_DIFF_TTL_MS = 30_000;
+let wsDiffCache: { at: number; files: DiffFile[] } | null = null;
+let wsDiffLoading: Promise<DiffFile[]> | null = null;
 
-function resolveWorkspacePath(rel: string): string {
-  const root = path.resolve(DIR);
-  const resolved = path.resolve(root, rel);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error("path is outside the workspace");
+async function loadWorkspaceDiff(): Promise<DiffFile[]> {
+  if (!wsDiffLoading) {
+    wsDiffLoading = (async () => {
+      const r = await runDv(["diff", "--color", "never"], { dir: DIR, timeoutMs: 120_000 });
+      const files = parseWorkspaceDiff(`${r.stdout}\n${r.stderr}`);
+      wsDiffCache = { at: Date.now(), files };
+      return files;
+    })().finally(() => {
+      wsDiffLoading = null;
+    });
   }
-  return resolved;
-}
-
-const stripCR = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
-
-/**
- * Revert one changed line of the working file (the GUI's line-level undo).
- * kind "add": the working file gained this line at 1-based `line` — delete it.
- * kind "del": the working file lost the base line at 1-based `line` — re-insert it.
- * Line endings are preserved (CRLF files keep CRLF).
- */
-function revertLineInFile(rel: string, kind: string, line: number, text: string): void {
-  const abs = resolveWorkspacePath(rel);
-  const buf = readFileSync(abs);
-  if (buf.subarray(0, 8192).includes(0)) throw new Error("二进制文件不支持行级回退");
-  const raw = buf.toString("utf8");
-  const lines = raw.split("\n"); // entries keep their "\r" on CRLF files
-  if (kind === "add") {
-    const idx = line - 1;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= lines.length) {
-      throw new Error("行号超出文件范围 — 请刷新 diff 后重试");
-    }
-    if (stripCR(lines[idx]) !== stripCR(text)) {
-      throw new Error("文件内容已变化，与 diff 不一致 — 请刷新后重试");
-    }
-    lines.splice(idx, 1);
-    writeFileSync(abs, lines.length === 1 && lines[0] === "" ? "" : lines.join("\n"));
-    return;
-  }
-  if (kind === "del") {
-    const idx = line - 1;
-    if (!Number.isInteger(idx) || idx < 0 || idx > lines.length) {
-      throw new Error("文件行数已变化，与 diff 不一致 — 请刷新后重试");
-    }
-    const eol = raw.includes("\r\n") ? "\r\n" : "\n";
-    lines.splice(idx, 0, text + (eol === "\r\n" ? "\r" : ""));
-    writeFileSync(abs, lines.join("\n"));
-    return;
-  }
-  throw new Error(`unknown revert kind: ${kind}`);
+  return wsDiffLoading;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -257,7 +166,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       const html = readFileSync(path.join(ROOT, "ui", "index.html"), "utf8");
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
       res.end(html);
       return;
     }
@@ -268,7 +177,10 @@ const server = http.createServer(async (req, res) => {
       const p = path.join(ROOT, "ui", "vendor", file);
       if (existsSync(p)) {
         const types: Record<string, string> = { ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
-        res.writeHead(200, { "Content-Type": types[path.extname(p)] ?? "application/octet-stream" });
+        res.writeHead(200, {
+          "Content-Type": types[path.extname(p)] ?? "application/octet-stream",
+          "Cache-Control": "public, max-age=86400",
+        });
         res.end(readFileSync(p));
       } else {
         sendJson(res, 404, { error: "not found" });
@@ -334,18 +246,47 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/workspace-diff") {
-      const args = ["diff", "--color", "never"];
       const p = url.searchParams.get("path");
-      if (p) args.push(p);
-      const r = await runDv(args, { dir: DIR, timeoutMs: 120_000 });
-      sendJson(res, 200, { files: parseWorkspaceDiff(`${r.stdout}\n${r.stderr}`) });
+      if (p) {
+        // Single-file lookup: always fresh from dv, bypasses the model cache.
+        const r = await runDv(["diff", "--color", "never", p], { dir: DIR, timeoutMs: 120_000 });
+        sendJson(res, 200, { files: parseWorkspaceDiff(`${r.stdout}\n${r.stderr}`) });
+        return;
+      }
+      const refresh = url.searchParams.get("refresh") === "1";
+      if (refresh || !wsDiffCache || Date.now() - wsDiffCache.at > WS_DIFF_TTL_MS) {
+        await loadWorkspaceDiff();
+      }
+      sendJson(res, 200, { at: wsDiffCache!.at, files: wsDiffCache!.files });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/revert-line") {
       const body = await readBody(req);
-      revertLineInFile(String(body.path ?? ""), String(body.kind ?? ""), Number(body.line), String(body.text ?? ""));
-      sendJson(res, 200, { ok: true });
+      const p = String(body.path ?? "");
+      const kind = String(body.kind ?? "");
+      const line = Number(body.line);
+      const text = String(body.text ?? "");
+      revertLineInFile(DIR, p, kind, line, text); // disk first; strict validation
+      if (!wsDiffCache) {
+        // No model to mirror into (server restarted after the client loaded).
+        // The client must wait out dv's sync lag, then force-reload.
+        sendJson(res, 200, { ok: true, file: null, stale: true });
+        return;
+      }
+      try {
+        const file = applyRevertToModel(wsDiffCache.files, p, kind, line, text);
+        // The mirrored model is now fresher than any dv snapshot — restart TTL.
+        wsDiffCache.at = Date.now();
+        sendJson(res, 200, { ok: true, file });
+      } catch (e) {
+        if (e instanceof StaleModelError) {
+          wsDiffCache = null; // force reload from dv on next fetch
+          sendJson(res, 409, { error: e.message, stale: true });
+          return;
+        }
+        throw e;
+      }
       return;
     }
 
@@ -371,6 +312,7 @@ const server = http.createServer(async (req, res) => {
             dir: DIR,
             timeoutMs: 300_000,
           });
+          if (r.ok) wsDiffCache = null; // merge rewrote the workspace
           sendJson(res, r.ok ? 200 : 500, { ok: r.ok, output: `${r.stdout}\n${r.stderr}`.trim() });
           return;
         }

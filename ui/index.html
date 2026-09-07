@@ -27,20 +27,43 @@
   i.sign { display: inline-block; width: 14px; font-style: normal; user-select: none; opacity: .7; }
   .add i.sign { color: var(--green); }
   .del i.sign { color: var(--red); }
-  .diffcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
-  .diffhead { padding: 6px 12px; background: #f0f2f5; border-bottom: 1px solid var(--border); }
+  .fileblock { margin-bottom: 14px; }
+  .diffhead {
+    position: sticky; top: 0; z-index: 3;
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 12px; background: #eef1f5;
+    border: 1px solid var(--border); border-bottom: none;
+    border-radius: 10px 10px 0 0;
+  }
+  .diffhead .path { flex: 1; font-weight: 600; }
+  .diffcard { background: var(--panel); border: 1px solid var(--border); border-radius: 0 0 10px 10px; overflow: hidden; }
+  .st { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+  .st .p { color: var(--green); font-weight: 600; }
+  .st .m { color: var(--red); font-weight: 600; }
   .hunkband { background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 11.5px; padding: 3px 12px; border-top: 1px solid var(--border); }
-  .dl { display: flex; align-items: flex-start; font-family: var(--mono); font-size: 12px; line-height: 1.7; }
+  .diffbody > .hunkband:first-child { border-top: none; }
+  .dl { display: flex; align-items: flex-start; font-family: var(--mono); font-size: 12px; line-height: 1.7; border-left: 3px solid transparent; }
   .dl:hover { background: #f2f6fb; }
-  .dl.add { background: var(--green-soft); }
-  .dl.del { background: var(--red-soft); }
-  .dl .ln { flex: 0 0 40px; text-align: right; padding-right: 6px; color: var(--dim); user-select: none; font-size: 11px; }
+  .dl.add { background: var(--green-soft); border-left-color: var(--green); }
+  .dl.del { background: var(--red-soft); border-left-color: var(--red); }
+  .dl .ln { flex: 0 0 44px; text-align: right; padding-right: 8px; color: var(--dim); user-select: none; font-size: 11px; background: rgba(0,0,0,.028); border-right: 1px solid var(--border); }
+  .dl .ln + .ln { margin-right: 4px; }
   .dl .sign { flex: 0 0 14px; text-align: center; font-style: normal; user-select: none; }
   .dl.add .sign { color: var(--green); }
+  .dl.del .sign { color: var(--red); }
   .dl .code { white-space: pre-wrap; word-break: break-all; flex: 1; padding-right: 6px; }
-  button.rv { visibility: hidden; flex: 0 0 26px; margin-right: 8px; border: none; background: none; color: var(--dim); cursor: pointer; font-size: 13px; padding: 0; }
+  button.rv { visibility: hidden; flex: 0 0 26px; margin-right: 8px; border: none; background: none; color: var(--dim); cursor: pointer; font-size: 13px; padding: 0; border-radius: 5px; }
   .dl:hover button.rv { visibility: visible; }
-  .dl button.rv:hover { color: var(--red); }
+  .dl button.rv:hover { color: var(--red); background: var(--red-soft); }
+  button:disabled { opacity: .55; cursor: default; }
+  button:focus-visible, .file-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .diffnav { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .diffnav .cur { font-family: var(--mono); font-size: 12.5px; font-weight: 600; flex: 1; word-break: break-all; }
+  #toast { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  #toast div { background: #24292f; color: #fff; border-radius: 8px; padding: 8px 14px; font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,.18); animation: toastin .18s ease-out; }
+  @keyframes toastin { from { transform: translateY(8px); opacity: 0; } }
+  .file-row .path { flex: 1; }
+  .file-row .st { margin-left: auto; }
   header .brand { font-weight: 700; font-size: 15px; }
   header .brand span { color: var(--accent); }
   .chip {
@@ -163,12 +186,13 @@
   </aside>
   <section id="content">
     <div id="home">
-      <h2>提交历史</h2>
+      <h2 id="home-title">提交历史</h2>
       <div class="card" id="log"><span class="spin">加载中…</span></div>
     </div>
     <div id="review-pane" style="display:none"></div>
   </section>
 </main>
+<div id="toast"></div>
 <script src="/vendor/highlight.min.js"></script>
 <script>
 "use strict";
@@ -179,26 +203,57 @@ let reviews = [];
 let currentId = null;
 let currentReview = null;
 let info = null;
+let lastState = null;
+/** Client mirror of the server-side workspace-diff model. */
+let wsModel = null;      // { files, atClient }
+let wsViewPath = null;   // null = all changed files
+let wsDiffOpen = false;  // workspace diff view currently on screen
+const WS_TTL = 30_000;   // mirrors the server cache TTL
 
 function banner(text, ok) {
   $("banner").innerHTML = text ? `<div class="${ok ? "ok" : ""}">${esc(text)}</div>` : "";
 }
 
+function toast(text) {
+  const el = document.createElement("div");
+  el.textContent = text;
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.stale = !!body.stale;
+    throw err;
+  }
   return body;
+}
+
+function statHtml(path) {
+  const f = wsModel?.files.find((x) => x.path === path);
+  if (!f) return "";
+  let a = 0, d = 0;
+  for (const h of f.hunks) for (const l of h.lines) {
+    if (l.t === "+") a++;
+    else if (l.t === "-") d++;
+  }
+  return `<span class="st"><span class="p">+${a}</span> <span class="m">−${d}</span></span>`;
 }
 
 function changeRows(changes) {
   if (!changes.length) return `<div class="empty ok">✓ 工作区干净，没有待提交的变更</div>`;
-  return `<div class="card" style="padding:4px 6px">` + changes.map((c) =>
-    `<div class="file-row" onclick="showWorkspaceDiff('${esc(c.path).replace(/'/g, "")}')">
+  const head = `<div style="display:flex;justify-content:flex-end;margin-bottom:4px">
+    <button class="btn" style="font-size:12px;padding:2px 10px" onclick="showWorkspaceDiff()">查看全部 diff</button></div>`;
+  return head + `<div class="card" style="padding:4px 6px">` + changes.map((c) =>
+    `<div class="file-row" tabindex="0" data-path="${esc(c.path)}">
        <span class="badge ${esc(c.status)}" title="${esc(STATUS_LABEL[c.status] ?? c.status)}">${esc(c.status)}</span>
-       <span class="path">${esc(c.path)}</span>
+       <span class="path">${esc(c.path)}</span>${statHtml(c.path)}
      </div>`).join("") + `</div>`;
 }
+
 
 function branchRows(branches) {
   if (!branches.length) return `<div class="empty">没有分支信息</div>`;
@@ -241,7 +296,8 @@ function renderState(state) {
     `<span class="chip"><b>${esc(info.branch ?? "?")}</b></span>` +
     `<span class="chip"><span class="mono">${esc(info.commit ?? "")}</span></span>` +
     `<span class="chip">工作区：${esc(info.workspace ?? "?")}</span>` + sync;
-  $("changes").innerHTML = changeRows(state.changes);
+  lastState = state;
+  renderChanges();
   $("branches").innerHTML = branchRows(state.branches);
   $("log").innerHTML = state.log.length
     ? state.log.map((c) => `<div class="commit-row"><span class="commit-id">${esc(c.id.replace("dv.commit.", ""))}</span><span>${esc(c.subject)}</span></div>`).join("")
@@ -254,6 +310,10 @@ async function loadReviews() {
   $("reviews").innerHTML = reviewCards(reviews);
 }
 
+function renderChanges() {
+  if (lastState) $("changes").innerHTML = changeRows(lastState.changes);
+}
+
 function reviewerChips(r) {
   const names = new Map((r.reviewers ?? []).map((u) => [u.id, u.full_name || u.name || u.email || u.id]));
   return (r.reviewer_statuses ?? []).map((s) =>
@@ -262,6 +322,7 @@ function reviewerChips(r) {
 
 async function openReview(id) {
   currentId = id;
+  wsDiffOpen = false;
   banner("");
   const data = await api(`/api/review?id=${encodeURIComponent(id)}`);
   currentReview = data.review;
@@ -269,7 +330,7 @@ async function openReview(id) {
   const who = (u) => esc(u?.full_name || u?.name || u?.email || u?.id || "?");
   const files = data.files.length
     ? `<div class="card" style="padding:4px 6px">` + data.files.map((c) =>
-        `<div class="file-row" onclick="showDiff('${esc(c.path).replace(/'/g, "")}')">
+        `<div class="file-row" tabindex="0" data-rpath="${esc(c.path)}">
            <span class="badge ${esc(c.status)}" title="${esc(STATUS_LABEL[c.status] ?? c.status)}">${esc(c.status)}</span>
            <span class="path">${esc(c.path)}</span>
          </div>`).join("") + `</div>`
@@ -364,61 +425,130 @@ async function showDiff(path) {
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-function renderWorkspaceDiff(files) {
-  if (!files.length) return `<div class="empty ok">✓ 工作区干净，没有待提交的变更</div>`;
-  return files.map((f) => {
-    if (f.binary) {
-      return `<div class="diffcard"><div class="diffhead"><span class="path">${esc(f.path)}</span></div><div class="meta" style="padding:8px 12px">二进制文件 — 不支持行级操作</div></div>`;
-    }
-    const rows = f.hunks.map((h) =>
-      `<div class="hunkband">${esc(h.header)}</div>` +
-      h.lines.map((l) => {
-        const revert = l.t === " " ? "" :
-          `<button class="rv" data-kind="${l.t === "+" ? "add" : "del"}" data-line="${l.n}" data-path="${esc(f.path)}" data-text="${esc(l.text)}" title="回退此行">↩</button>`;
-        const cls = l.t === "+" ? "add" : l.t === "-" ? "del" : "ctx";
-        return `<div class="dl ${cls}"><span class="ln">${l.t === "-" ? l.n : ""}</span><span class="ln">${l.t === "-" ? "" : l.n}</span><i class="sign">${esc(l.t)}</i><span class="code">${hi(l.text, langOf(f.path))}</span>${revert}</div>`;
-      }).join("")
-    ).join("");
-    return `<div class="diffcard"><div class="diffhead"><span class="path">${esc(f.path)}</span></div><div class="diffbody">${rows}</div></div>`;
-  }).join("");
+function fileCardHtml(f) {
+  let a = 0, d = 0;
+  for (const h of f.hunks) for (const l of h.lines) {
+    if (l.t === "+") a++;
+    else if (l.t === "-") d++;
+  }
+  const head = `<div class="diffhead"><span class="path">${esc(f.path)}</span><span class="st"><span class="p">+${a}</span> <span class="m">−${d}</span></span></div>`;
+  if (f.binary) {
+    return `<div class="fileblock" data-file="${esc(f.path)}">${head}<div class="diffcard"><div class="meta" style="padding:8px 12px">二进制文件 — 不支持行级操作</div></div></div>`;
+  }
+  const rows = f.hunks.map((h) =>
+    `<div class="hunkband">${esc(h.header)}</div>` +
+    h.lines.map((l) => {
+      const revert = l.t === " " ? "" :
+        `<button class="rv" data-kind="${l.t === "+" ? "add" : "del"}" data-line="${l.nn}" data-path="${esc(f.path)}" data-text="${esc(l.text)}" title="回退此行">↩</button>`;
+      const cls = l.t === "+" ? "add" : l.t === "-" ? "del" : "ctx";
+      return `<div class="dl ${cls}"><span class="ln">${l.n ?? ""}</span><span class="ln">${l.t === "-" ? "" : (l.nn ?? "")}</span><i class="sign">${esc(l.t)}</i><span class="code">${hi(l.text, langOf(f.path))}</span>${revert}</div>`;
+    }).join("")
+  ).join("");
+  return `<div class="fileblock" data-file="${esc(f.path)}">${head}<div class="diffcard"><div class="diffbody">${rows}</div></div></div>`;
+}
+
+function renderWsView() {
+  const files = wsViewPath ? wsModel.files.filter((f) => f.path === wsViewPath) : wsModel.files;
+  const nav = `<div class="diffnav">
+      <span class="cur">${wsViewPath ? esc(wsViewPath) : `全部变更（${wsModel.files.length} 个文件）`}</span>
+      ${wsViewPath ? `<button class="btn" onclick="showWorkspaceDiff()">← 全部文件</button>` : ""}
+      <button class="btn" onclick="reloadWsDiff()">⟳ 重新加载</button>
+    </div>`;
+  $("log").innerHTML = nav + (files.length
+    ? files.map(fileCardHtml).join("")
+    : wsViewPath
+      ? `<div class="empty">该文件没有文本 diff —— 可能是空文件、目录或仅元数据变更</div>`
+      : `<div class="empty ok">✓ 没有待提交的变更</div>`);
+}
+async function ensureWsModel(force) {
+  if (force || !wsModel || Date.now() - wsModel.atClient > WS_TTL) {
+    const data = await api("/api/workspace-diff?refresh=1");
+    wsModel = { files: data.files ?? [], atClient: Date.now() };
+    renderChanges(); // sidebar +/- stats come from the model
+  }
 }
 
 async function showWorkspaceDiff(path) {
+  wsViewPath = path ?? null;
+  wsDiffOpen = true;
   $("review-pane").style.display = "none";
   $("home").style.display = "block";
+  $("home-title").textContent = "工作区 diff";
+  $("log").classList.remove("card");
   $("log").innerHTML = `<span class="spin">加载 diff…</span>`;
-  const q = path ? "?path=" + encodeURIComponent(path) : "";
-  const [data, state] = await Promise.all([
-    fetch(`/api/workspace-diff${q}`).then((r) => r.json()),
-    fetch("/api/state").then((r) => r.json()),
-  ]);
-  renderState(state);
-  $("log").innerHTML = `<h2>待提交变更 · diff（悬停变更行 → ↩ 回退）</h2>` + renderWorkspaceDiff(data.files ?? []);
+  try {
+    await ensureWsModel(false);
+    if (wsDiffOpen) renderWsView();
+  } catch (e) {
+    banner(String(e.message || e), false);
+    backHome();
+  }
+}
+
+async function reloadWsDiff() {
+  if (!wsDiffOpen) return;
+  $("log").innerHTML = `<span class="spin">加载 diff…</span>`;
+  try {
+    await ensureWsModel(true);
+    if (wsDiffOpen) renderWsView();
+  } catch (e) { banner(String(e.message || e), false); }
 }
 
 async function revertLine(btn) {
   const { kind, line, text, path } = btn.dataset;
   btn.disabled = true;
   try {
-    await api("/api/revert-line", {
+    const res = await api("/api/revert-line", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, kind, line: Number(line), text }),
     });
-    banner("已回退 1 行", true);
-    if (kind === "add") {
-      btn.closest(".dl").remove(); // 乐观更新：dv diff 有秒级同步滞后
+    if (res.stale) {
+      // Disk reverted but the server had no model to mirror into (e.g. it
+      // restarted after page load) — wait out dv's sync lag, then reload.
+      toast("已回退 1 行 — 等待 dv 同步后重载…");
+      setTimeout(() => reloadWsDiff(), 3000);
+      return;
     }
-    setTimeout(() => showWorkspaceDiff(path), 3000); // 之后以后台刷新为准
+    const files = wsModel.files;
+    const i = files.findIndex((f) => f.path === path);
+    if (res.file) {
+      if (i >= 0) files[i] = res.file;
+      else files.push(res.file);
+    } else if (i >= 0) files.splice(i, 1);
+    wsModel.atClient = Date.now();
+    const block = document.querySelector(`.fileblock[data-file="${CSS.escape(path)}"]`);
+    if (block) {
+      block.outerHTML = res.file
+        ? fileCardHtml(res.file)
+        : `<div class="fileblock"><div class="empty ok">✓ ${esc(path)} 的变更已全部回退</div></div>`;
+    } else {
+      renderWsView();
+    }
+    renderChanges();
+    toast("已回退 1 行");
   } catch (e) {
-    banner(String(e.message || e), false);
-    btn.disabled = false;
+    if (e.stale) {
+      // Model disagreed with the request — reload the truth from dv.
+      toast("模型已过期 — 正在重新加载 diff");
+      reloadWsDiff();
+    } else {
+      banner(String(e.message || e), false);
+      btn.disabled = false;
+    }
   }
 }
 
 document.addEventListener("click", (ev) => {
   const b = ev.target.closest("button.rv");
-  if (b) revertLine(b);
+  if (b) { revertLine(b); return; }
+  const row = ev.target.closest(".file-row[data-path]");
+  if (row) { showWorkspaceDiff(row.dataset.path); return; }
+  const rrow = ev.target.closest(".file-row[data-rpath]");
+  if (rrow) showDiff(rrow.dataset.rpath);
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && ev.target.classList?.contains("file-row")) ev.target.click();
 });
 
 async function act(action) {
@@ -438,8 +568,12 @@ async function act(action) {
 }
 
 function backHome() {
+  wsDiffOpen = false;
   $("review-pane").style.display = "none";
   $("home").style.display = "block";
+  $("home-title").textContent = "提交历史";
+  $("log").classList.add("card");
+  if (lastState) renderState(lastState);
 }
 
 async function postComment() {
@@ -471,11 +605,17 @@ async function promptNewReview() {
 }
 
 async function refreshAll() {
+  banner("");
   try {
-    banner("");
-    const [state] = await Promise.all([api("/api/state"), loadReviews()]);
-    renderState(state);
+    renderState(await api("/api/state"));
   } catch (e) { banner(String(e.message || e), false); }
+  // Reviews need the optional REST token — never let them block state.
+  loadReviews().catch((e) => {
+    const msg = String(e.message || e);
+    const short = msg.startsWith("The Diversion REST API needs") ? "未配置 API token — review 功能不可用" : msg;
+    $("reviews").innerHTML = `<div class="empty" title="${esc(msg)}">${esc(short)}</div>`;
+  });
+  if (wsDiffOpen) reloadWsDiff();
 }
 
 refreshAll();
