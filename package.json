@@ -1,0 +1,30 @@
+{
+  "name": "dv-review-gui",
+  "version": "0.1.0",
+  "description": "Standalone browser GUI for the Diversion (dv) version control system: workspace status, pending changes, and the full human review workflow.",
+  "type": "module",
+  "bin": {
+    "dv-review-gui": "dist/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "diversion",
+    "dv",
+    "version-control",
+    "review",
+    "gui",
+    "zed"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
