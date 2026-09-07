@@ -18,7 +18,7 @@
  */
 import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runDv } from "./dv.js";
@@ -130,6 +130,128 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return promise;
 }
 
+export interface DiffLine {
+  t: "+" | "-" | " ";
+  text: string;
+  /** 1-based line number: new-file line for +/context, old-file line for - */
+  n?: number;
+}
+export interface DiffHunk {
+  oldStart: number;
+  newStart: number;
+  header: string;
+  lines: DiffLine[];
+}
+export interface DiffFile {
+  path: string;
+  binary: boolean;
+  hunks: DiffHunk[];
+}
+
+export function parseWorkspaceDiff(text: string): DiffFile[] {
+  const files: DiffFile[] = [];
+  let cur: DiffFile | undefined;
+  let hunk: DiffHunk | undefined;
+  let oldNo = 0;
+  let newNo = 0;
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("diff --git ")) {
+      cur = { path: line.match(/^diff --git a\/(.*) b\/(.*)$/)?.[2] ?? "", binary: false, hunks: [] };
+      files.push(cur);
+      hunk = undefined;
+      continue;
+    }
+    if (!cur) continue;
+    if (/^Binary files /.test(line) || line.includes("Binary files")) {
+      cur.binary = true;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+      if (!m) {
+        hunk = undefined;
+        continue;
+      }
+      hunk = { oldStart: Number(m[1]), newStart: Number(m[3]), header: line, lines: [] };
+      cur.hunks.push(hunk);
+      oldNo = Number(m[1]);
+      newNo = Number(m[3]);
+      continue;
+    }
+    if (
+      line.startsWith("+++ ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("index ") ||
+      /^(new|deleted) file mode|^similarity index|^rename (from|to)/.test(line)
+    ) {
+      continue;
+    }
+    if (!hunk) continue;
+    if (line.startsWith("+")) {
+      hunk.lines.push({ t: "+", text: line.slice(1), n: newNo });
+      newNo++;
+    } else if (line.startsWith("-")) {
+      hunk.lines.push({ t: "-", text: line.slice(1), n: oldNo });
+      oldNo++;
+    } else {
+      // context line ("content" or empty); dv emits empty strings for blank lines
+      hunk.lines.push({ t: " ", text: line.startsWith(" ") ? line.slice(1) : "", n: newNo });
+      newNo++;
+      oldNo++;
+    }
+  }
+  return files;
+}
+
+function resolveWorkspacePath(rel: string): string {
+  const root = path.resolve(DIR);
+  const resolved = path.resolve(root, rel);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new Error("path is outside the workspace");
+  }
+  return resolved;
+}
+
+const stripCR = (s: string) => (s.endsWith("\r") ? s.slice(0, -1) : s);
+
+/**
+ * Revert one changed line of the working file (the GUI's line-level undo).
+ * kind "add": the working file gained this line at 1-based `line` — delete it.
+ * kind "del": the working file lost the base line at 1-based `line` — re-insert it.
+ * Line endings are preserved (CRLF files keep CRLF).
+ */
+function revertLineInFile(rel: string, kind: string, line: number, text: string): void {
+  const abs = resolveWorkspacePath(rel);
+  const buf = readFileSync(abs);
+  if (buf.subarray(0, 8192).includes(0)) throw new Error("二进制文件不支持行级回退");
+  const raw = buf.toString("utf8");
+  const lines = raw.split("\n"); // entries keep their "\r" on CRLF files
+  if (kind === "add") {
+    const idx = line - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= lines.length) {
+      throw new Error("行号超出文件范围 — 请刷新 diff 后重试");
+    }
+    if (stripCR(lines[idx]) !== stripCR(text)) {
+      throw new Error("文件内容已变化，与 diff 不一致 — 请刷新后重试");
+    }
+    lines.splice(idx, 1);
+    writeFileSync(abs, lines.length === 1 && lines[0] === "" ? "" : lines.join("\n"));
+    return;
+  }
+  if (kind === "del") {
+    const idx = line - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx > lines.length) {
+      throw new Error("文件行数已变化，与 diff 不一致 — 请刷新后重试");
+    }
+    const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+    lines.splice(idx, 0, text + (eol === "\r\n" ? "\r" : ""));
+    writeFileSync(abs, lines.join("\n"));
+    return;
+  }
+  throw new Error(`unknown revert kind: ${kind}`);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
   try {
@@ -210,6 +332,23 @@ const server = http.createServer(async (req, res) => {
       res.end(r.stdout || r.stderr || "(no differences)");
       return;
     }
+
+    if (req.method === "GET" && url.pathname === "/api/workspace-diff") {
+      const args = ["diff", "--color", "never"];
+      const p = url.searchParams.get("path");
+      if (p) args.push(p);
+      const r = await runDv(args, { dir: DIR, timeoutMs: 120_000 });
+      sendJson(res, 200, { files: parseWorkspaceDiff(`${r.stdout}\n${r.stderr}`) });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/revert-line") {
+      const body = await readBody(req);
+      revertLineInFile(String(body.path ?? ""), String(body.kind ?? ""), Number(body.line), String(body.text ?? ""));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
 
     if (req.method === "POST" && url.pathname === "/api/new-review") {
       const body = await readBody(req);
