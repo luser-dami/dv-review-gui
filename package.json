@@ -1,6 +1,6 @@
 {
   "name": "dv-review-gui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Standalone browser GUI for the Diversion (dv) version control system: workspace status, pending changes, and the full human review workflow.",
   "type": "module",
   "bin": {

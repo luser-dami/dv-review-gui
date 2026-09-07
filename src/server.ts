@@ -31,7 +31,7 @@ import {
   type DiffFile,
 } from "./model.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const PORT = Number(process.env.DV_UI_PORT ?? 7391);
 const DIR = process.argv[2] ?? process.env.DV_WORKSPACE_DIR ?? process.cwd();
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -165,7 +165,13 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
   try {
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      const html = readFileSync(path.join(ROOT, "ui", "index.html"), "utf8");
+      // Stamp the running server's version into the page: an outdated process
+      // still serves the newest index.html from disk, so the client must be
+      // able to detect that its API peer is stale.
+      const html = readFileSync(path.join(ROOT, "ui", "index.html"), "utf8").replace(
+        "%DV_GUI_VERSION%",
+        VERSION,
+      );
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
       res.end(html);
       return;
@@ -196,6 +202,7 @@ const server = http.createServer(async (req, res) => {
         runDv(["branch"], { dir: DIR, timeoutMs: 30_000 }),
       ]);
       sendJson(res, 200, {
+        version: VERSION,
         dir: DIR,
         info: parseStatus(`${status.stdout}\n${status.stderr}`),
         changes: parseNameStatus(`${changes.stdout}\n${changes.stderr}`),

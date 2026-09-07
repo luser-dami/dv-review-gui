@@ -209,6 +209,9 @@ let wsModel = null;      // { files, atClient }
 let wsViewPath = null;   // null = all changed files
 let wsDiffOpen = false;  // workspace diff view currently on screen
 const WS_TTL = 30_000;   // mirrors the server cache TTL
+// Stamped by the serving process; a literal placeholder means an outdated
+// server served this page (its API model lacks the fields this UI needs).
+const SERVER_VERSION = "%DV_GUI_VERSION%";
 
 function banner(text, ok) {
   $("banner").innerHTML = text ? `<div class="${ok ? "ok" : ""}">${esc(text)}</div>` : "";
@@ -438,7 +441,7 @@ function fileCardHtml(f) {
   const rows = f.hunks.map((h) =>
     `<div class="hunkband">${esc(h.header)}</div>` +
     h.lines.map((l) => {
-      const revert = l.t === " " ? "" :
+      const revert = l.t === " " || l.nn == null ? "" :
         `<button class="rv" data-kind="${l.t === "+" ? "add" : "del"}" data-line="${l.nn}" data-path="${esc(f.path)}" data-text="${esc(l.text)}" title="回退此行">↩</button>`;
       const cls = l.t === "+" ? "add" : l.t === "-" ? "del" : "ctx";
       return `<div class="dl ${cls}"><span class="ln">${l.n ?? ""}</span><span class="ln">${l.t === "-" ? "" : (l.nn ?? "")}</span><i class="sign">${esc(l.t)}</i><span class="code">${hi(l.text, langOf(f.path))}</span>${revert}</div>`;
@@ -607,7 +610,11 @@ async function promptNewReview() {
 async function refreshAll() {
   banner("");
   try {
-    renderState(await api("/api/state"));
+    const state = await api("/api/state");
+    if (state.version !== SERVER_VERSION) {
+      banner(`界面（${SERVER_VERSION}）与服务端（${state.version ?? "旧版"}）版本不一致 —— 端口 ${location.port} 上有旧实例在运行。请完全退出后重新启动（Zed 里再按一次快捷键无效时，先杀掉占用进程）。`);
+    }
+    renderState(state);
   } catch (e) { banner(String(e.message || e), false); }
   // Reviews need the optional REST token — never let them block state.
   loadReviews().catch((e) => {
